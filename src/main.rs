@@ -1,5 +1,7 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, iter};
 
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
@@ -7,6 +9,99 @@ use winit::{
 };
 
 mod logic;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Vertex {
+    _pos: [f32; 2],
+    _color: [f32; 4],
+}
+
+fn create_bundle(
+    device: &wgpu::Device,
+    swapchain_format: wgpu::TextureFormat,
+    shader: &wgpu::ShaderModule,
+    pipeline_layout: &wgpu::PipelineLayout,
+    sample_count: u32,
+    vertex_buffer: &wgpu::Buffer,
+    vertex_count: u32,
+) -> wgpu::RenderBundle {
+    log::info!("sample_count: {}", sample_count);
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(swapchain_format.into())],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview: None,
+        cache: None,
+    });
+
+    let mut encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+        label: None,
+        color_formats: &[Some(swapchain_format.into())],
+        depth_stencil: None,
+        sample_count,
+        multiview: None,
+    });
+    encoder.set_pipeline(&pipeline);
+    encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
+    encoder.draw(0..vertex_count, 0..1);
+    encoder.finish(&wgpu::RenderBundleDescriptor {
+        label: Some("main"),
+    })
+}
+
+fn create_multisampled_framebuffer(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    swapchain_format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> wgpu::TextureView {
+    let multisampled_texture_extent = wgpu::Extent3d {
+        width: config.width,
+        height: config.height,
+        depth_or_array_layers: 1,
+    };
+    let multisampled_frame_descriptor = &wgpu::TextureDescriptor {
+        size: multisampled_texture_extent,
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: swapchain_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        label: None,
+        view_formats: &[],
+    };
+
+    device
+        .create_texture(multisampled_frame_descriptor)
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
 
 async fn run(event_loop: EventLoop<()>, window: Window) {
     let mut size = window.inner_size();
@@ -49,35 +144,62 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         push_constant_ranges: &[],
     });
 
-    let swapchain_capabilities = surface.get_capabilities(&adapter);
-    let swapchain_format = swapchain_capabilities.formats[0];
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            compilation_options: Default::default(),
-            targets: &[Some(swapchain_format.into())],
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    });
-
     let mut config = surface
         .get_default_config(&adapter, size.width, size.height)
         .unwrap();
+
     surface.configure(&device, &config);
+
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0];
+
+    let sample_flags = adapter.get_texture_format_features(swapchain_format).flags;
+
+    let sample_count = {
+        if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X16) {
+            16
+        } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8) {
+            8
+        } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4) {
+            4
+        } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X2) {
+            2
+        } else {
+            1
+        }
+    };
+
+    let mut vertex_data = vec![];
+    let max = 50;
+    for i in 0..max {
+        let percent = i as f32 / max as f32;
+        let (sin, cos) = (percent * 2.0 * std::f32::consts::PI).sin_cos();
+        vertex_data.push(Vertex {
+            _pos: [0.0, 0.0],
+            _color: [1.0, -sin, cos, 1.0],
+        });
+        vertex_data.push(Vertex {
+            _pos: [cos, sin],
+            _color: [sin, -cos, 1.0, 1.0],
+        });
+    }
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(&vertex_data),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let vertex_count = vertex_data.len() as u32;
+
+    let bundle = create_bundle(
+        &device,
+        swapchain_format,
+        &shader,
+        &pipeline_layout,
+        sample_count,
+        &vertex_buffer,
+        vertex_count,
+    );
 
     let window = &window;
     event_loop
@@ -102,31 +224,45 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         let frame = surface
                             .get_current_texture()
                             .expect("Failed to acquire next swap chain texture");
-                        let view = frame
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
+                        let view = if sample_count == 1 {
+                            frame
+                                .texture
+                                .create_view(&wgpu::TextureViewDescriptor::default())
+                        } else {
+                            create_multisampled_framebuffer(
+                                &device,
+                                &config,
+                                swapchain_format,
+                                sample_count,
+                            )
+                        };
+
                         let mut encoder =
                             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                 label: None,
                             });
                         {
-                            let mut rpass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            let rpass_color_attachment = wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: if sample_count == 1 {
+                                        wgpu::StoreOp::Store
+                                    } else {
+                                        wgpu::StoreOp::Discard
+                                    },
+                                },
+                            };
+                            encoder
+                                .begin_render_pass(&wgpu::RenderPassDescriptor {
                                     label: None,
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
+                                    color_attachments: &[Some(rpass_color_attachment)],
                                     depth_stencil_attachment: None,
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
-                                });
-                            rpass.set_pipeline(&render_pipeline);
-                            rpass.draw(0..3, 0..1);
+                                })
+                                .execute_bundles(iter::once(&bundle));
                         }
 
                         queue.submit(Some(encoder.finish()));
